@@ -4,6 +4,7 @@ import { Tool } from '@jrmc/adonis-mcp'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname, basename, extname } from 'node:path'
 import { readWorkspaceConfig } from './set_workspace_tool.js'
+import { workspaceStorage } from '#middleware/workspace_context'
 
 type Schema = BaseSchema<{
   source_path: { type: 'string' }
@@ -501,9 +502,14 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     'Konwertuje plik .md z dokumentacją procesu (format szablon-procesu.md) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Działa z dowolnym projektem – podaj workspace_root jako ścieżkę absolutną do katalogu projektu. Obsługuje: przepływ liniowy, AND split+merge, XOR decyzje, pętle, zdarzenia końcowe.'
 
   async handle({ args, response }: ToolContext<Schema>) {
-    // Priority: 1) args.workspace_root  2) mcp-workspace.json  3) MCP_WORKSPACE_ROOT (.env)
+    // Priority:
+    //   1. args.workspace_root        – jednorazowy override w wywołaniu
+    //   2. X-Workspace-Root header    – automatycznie z .mcp.json projektu (zalecane)
+    //   3. mcp-workspace.json         – ustawiony przez set_workspace / npm run workspace
+    //   4. MCP_WORKSPACE_ROOT (.env)  – fallback startowy
     const workspaceRoot =
       args?.workspace_root ||
+      workspaceStorage.getStore() ||
       (await readWorkspaceConfig()) ||
       process.env.MCP_WORKSPACE_ROOT ||
       ''
@@ -511,9 +517,11 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     if (!workspaceRoot) {
       return response.text(
         'BŁĄD: Nie ustawiono workspace.\n\n' +
-          'Opcja 1 (zalecana): wywołaj set_workspace(workspace_root: "C:/projects/twoj-projekt")\n' +
-          'Opcja 2: podaj workspace_root bezpośrednio w tym wywołaniu\n' +
-          'Opcja 3: ustaw MCP_WORKSPACE_ROOT w .env serwera i zrestartuj'
+          'Zalecane (automatyczne): dodaj nagłówek do .mcp.json projektu:\n' +
+          '  "headers": { "X-Workspace-Root": "C:/projects/twoj-projekt" }\n\n' +
+          'Alternatywnie:\n' +
+          '  • set_workspace(workspace_root: "C:/projects/twoj-projekt")\n' +
+          '  • podaj workspace_root w tym wywołaniu'
       )
     }
 

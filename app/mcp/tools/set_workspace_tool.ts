@@ -4,6 +4,7 @@ import { Tool } from '@jrmc/adonis-mcp'
 import { writeFile, readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { workspaceStorage } from '#middleware/workspace_context'
 
 type Schema = BaseSchema<{
   workspace_root: { type: 'string' }
@@ -32,28 +33,30 @@ export default class SetWorkspaceTool extends Tool<Schema> {
     'Bez argumentu – zwraca aktualnie ustawiony workspace.'
 
   async handle({ args, response }: ToolContext<Schema>) {
-    // Brak argumentu → zwróć aktualny stan
+    // Brak argumentu → zwróć aktualny stan (pokaż wszystkie źródła)
     if (!args?.workspace_root) {
-      const current = await readWorkspaceConfig()
-      if (current) {
-        return response.text(
-          `📁 Aktualny workspace: ${current}\n` +
-            `   (źródło: mcp-workspace.json)\n\n` +
-            `Aby zmienić: set_workspace(workspace_root: "<ścieżka>")`
-        )
+      const fromHeader = workspaceStorage.getStore()
+      const fromFile = await readWorkspaceConfig()
+      const fromEnv = process.env.MCP_WORKSPACE_ROOT
+
+      const active = fromHeader || fromFile || fromEnv
+
+      const lines: string[] = []
+      if (active) {
+        lines.push(`📁 Aktywny workspace: ${active}`)
+        lines.push(``)
       }
-      const envVal = process.env.MCP_WORKSPACE_ROOT
-      if (envVal) {
-        return response.text(
-          `📁 Aktualny workspace: ${envVal}\n` +
-            `   (źródło: MCP_WORKSPACE_ROOT w .env)\n\n` +
-            `Aby zmienić bez restartu: set_workspace(workspace_root: "<ścieżka>")`
-        )
+      lines.push(`Źródła (priorytet malejąco):`)
+      lines.push(`  1. X-Workspace-Root header: ${fromHeader ? `✅ ${fromHeader}` : '—'}`)
+      lines.push(`  2. mcp-workspace.json:       ${fromFile  ? `✅ ${fromFile}`   : '—'}`)
+      lines.push(`  3. MCP_WORKSPACE_ROOT (.env):${fromEnv   ? ` ✅ ${fromEnv}`   : ' —'}`)
+      if (!active) {
+        lines.push(``)
+        lines.push(`⚠️  Brak workspace. Dodaj nagłówek do .mcp.json projektu:`)
+        lines.push(`  "headers": { "X-Workspace-Root": "C:/projects/twoj-projekt" }`)
       }
-      return response.text(
-        `⚠️  Brak ustawionego workspace.\n` +
-          `Użyj: set_workspace(workspace_root: "C:/projects/twoj-projekt")`
-      )
+
+      return response.text(lines.join('\n'))
     }
 
     const newPath = args.workspace_root.trim()

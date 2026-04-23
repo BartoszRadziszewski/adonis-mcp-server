@@ -5,6 +5,8 @@
 > 2. **Szablon** – gotowy plik do skopiowania i uzupełnienia
 >
 > Generator BPMN (`generate_bpmn`) czyta pola z tabel i produkuje diagram. Pola oznaczone ⚙️ są wymagane przez generator. Pozostałe służą dokumentacji.
+> Autor szablonu Bartosz Radziszewski bartosz.radziszewski@gmail.com (2026-04-23)
+> https://github.com/BartoszRadziszewski/adonis-mcp-server
 
 ---
 

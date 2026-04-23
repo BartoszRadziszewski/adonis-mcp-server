@@ -7,6 +7,7 @@ import { join, dirname, basename, extname } from 'node:path'
 type Schema = BaseSchema<{
   source_path: { type: 'string' }
   output_path: { type: 'string' }
+  workspace_root: { type: 'string' }
 }>
 
 interface ProcessStep {
@@ -496,10 +497,21 @@ export default class GenerateBpmnTool extends Tool<Schema> {
   name = 'generate_bpmn'
   title = 'Generuj BPMN z Markdown'
   description =
-    'Konwertuje plik .md z dokumentacją procesu (format VIVE ERP / szablon-procesu.md) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Obsługuje: przepływ liniowy, bramki AND (split+merge), XOR (decyzje), pętle powrotne, zdarzenia końcowe.'
+    'Konwertuje plik .md z dokumentacją procesu (format szablon-procesu.md) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Działa z dowolnym projektem – podaj workspace_root jako ścieżkę absolutną do katalogu projektu. Obsługuje: przepływ liniowy, AND split+merge, XOR decyzje, pętle, zdarzenia końcowe.'
 
   async handle({ args, response }: ToolContext<Schema>) {
-    const workspaceRoot = process.env.MCP_WORKSPACE_ROOT || 'C:\\projects\\vive_ERP'
+    const workspaceRoot =
+      args?.workspace_root ||
+      process.env.MCP_WORKSPACE_ROOT ||
+      ''
+
+    if (!workspaceRoot) {
+      return response.text(
+        'BŁĄD: Podaj workspace_root (ścieżka absolutna do katalogu projektu) lub ustaw MCP_WORKSPACE_ROOT w .env serwera.\n' +
+          'Przykład: workspace_root = "C:\\\\projects\\\\moj-projekt"'
+      )
+    }
+
     const sourcePath = join(workspaceRoot, args?.source_path ?? '')
 
     if (!args?.source_path) {
@@ -558,15 +570,21 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     return {
       type: 'object',
       properties: {
+        workspace_root: {
+          type: 'string',
+          description:
+            'Absolutna ścieżka do katalogu projektu, np. "C:\\\\projects\\\\moj-projekt" lub "/home/user/projekty/erp". ' +
+            'Jeśli pominięte, używana jest zmienna MCP_WORKSPACE_ROOT z .env serwera.',
+        },
         source_path: {
           type: 'string',
           description:
-            'Ścieżka do pliku .md relatywna do MCP_WORKSPACE_ROOT. Np. procesy/Ochrona-Srodowiska/OS-001-SENT-wysylka-krajowa-as-is.md',
+            'Ścieżka do pliku .md relatywna do workspace_root. Np. procesy/P2P/P2P-001-zakup-surowca-as-is.md',
         },
         output_path: {
           type: 'string',
           description:
-            'Opcjonalna ścieżka wyjściowa .bpmn relatywna do MCP_WORKSPACE_ROOT. Domyślnie: raport/{nazwa-pliku}.bpmn',
+            'Opcjonalna ścieżka wyjściowa .bpmn relatywna do workspace_root. Domyślnie: raport/{nazwa-pliku}.bpmn',
         },
       },
       required: ['source_path'],

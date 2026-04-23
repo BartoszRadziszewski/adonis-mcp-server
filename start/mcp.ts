@@ -17,6 +17,7 @@ app.ready(async () => {
 
   // Lista toolsów z ich ścieżkami
   const toolFiles = [
+    'set_workspace_tool',
     'generate_bpmn_tool',
     'hello_world_tool',
   ]

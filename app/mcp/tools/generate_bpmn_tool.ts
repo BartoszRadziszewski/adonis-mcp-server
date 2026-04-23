@@ -3,6 +3,7 @@ import type { BaseSchema } from '@jrmc/adonis-mcp/types/method'
 import { Tool } from '@jrmc/adonis-mcp'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname, basename, extname } from 'node:path'
+import { readWorkspaceConfig } from './set_workspace_tool.js'
 
 type Schema = BaseSchema<{
   source_path: { type: 'string' }
@@ -500,15 +501,19 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     'Konwertuje plik .md z dokumentacją procesu (format szablon-procesu.md) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Działa z dowolnym projektem – podaj workspace_root jako ścieżkę absolutną do katalogu projektu. Obsługuje: przepływ liniowy, AND split+merge, XOR decyzje, pętle, zdarzenia końcowe.'
 
   async handle({ args, response }: ToolContext<Schema>) {
+    // Priority: 1) args.workspace_root  2) mcp-workspace.json  3) MCP_WORKSPACE_ROOT (.env)
     const workspaceRoot =
       args?.workspace_root ||
+      (await readWorkspaceConfig()) ||
       process.env.MCP_WORKSPACE_ROOT ||
       ''
 
     if (!workspaceRoot) {
       return response.text(
-        'BŁĄD: Podaj workspace_root (ścieżka absolutna do katalogu projektu) lub ustaw MCP_WORKSPACE_ROOT w .env serwera.\n' +
-          'Przykład: workspace_root = "C:\\\\projects\\\\moj-projekt"'
+        'BŁĄD: Nie ustawiono workspace.\n\n' +
+          'Opcja 1 (zalecana): wywołaj set_workspace(workspace_root: "C:/projects/twoj-projekt")\n' +
+          'Opcja 2: podaj workspace_root bezpośrednio w tym wywołaniu\n' +
+          'Opcja 3: ustaw MCP_WORKSPACE_ROOT w .env serwera i zrestartuj'
       )
     }
 

@@ -11,6 +11,9 @@ tmp/*
 *.sqlite3
 *.sqlite3-journal
 
+# Active workspace config (per-developer, not shared)
+mcp-workspace.json
+
 # Secrets
 .env
 .env.local

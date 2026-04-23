@@ -4,7 +4,6 @@ import { Tool } from '@jrmc/adonis-mcp'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname, basename, extname } from 'node:path'
 
-
 type Schema = BaseSchema<{
   source_path: { type: 'string' }
   output_path: { type: 'string' }
@@ -29,24 +28,77 @@ interface ProcessMeta {
   steps: ProcessStep[]
 }
 
+// ─── Routing types ────────────────────────────────────────────────────────────
+
+type RoutingType = 'linear' | 'and-split' | 'xor-split' | 'and-merge' | 'xor-merge' | 'loop' | 'end' | 'default'
+
+interface RouteTarget { id: string; label?: string }
+
+interface Routing {
+  type: RoutingType
+  targets: RouteTarget[]
+}
+
+function parseNextField(next: string): Routing {
+  const n = (next || '').trim()
+  if (!n) return { type: 'default', targets: [] }
+
+  if (n === '(koniec)') return { type: 'end', targets: [] }
+  if (n === '(scal AND)') return { type: 'and-merge', targets: [] }
+  if (n === '(scal XOR)') return { type: 'xor-merge', targets: [] }
+
+  // AND → [S4, S7]
+  const andM = n.match(/AND\s*[→>]\s*\[([^\]]+)\]/i)
+  if (andM) {
+    const targets = andM[1].split(',').map((s) => ({ id: s.trim().match(/S\d+/i)?.[0] ?? s.trim() }))
+    return { type: 'and-split', targets }
+  }
+
+  // XOR → [Tak: S5, Nie: S7]  or  XOR → [S5, S7]
+  const xorM = n.match(/XOR\s*[→>]\s*\[([^\]]+)\]/i)
+  if (xorM) {
+    const targets = xorM[1].split(',').map((s) => {
+      const t = s.trim()
+      const ci = t.indexOf(':')
+      if (ci > 0) return { label: t.slice(0, ci).trim(), id: t.slice(ci + 1).trim().match(/S\d+/i)?.[0] ?? t.slice(ci + 1).trim() }
+      return { id: t.match(/S\d+/i)?.[0] ?? t }
+    })
+    return { type: 'xor-split', targets }
+  }
+
+  // pętla → S2
+  const loopM = n.match(/p[eę]tla\s*[→>]\s*(S\d+)/i)
+  if (loopM) return { type: 'loop', targets: [{ id: loopM[1] }] }
+
+  // Simple S3
+  const stepM = n.match(/^(S\d+)/i)
+  if (stepM) return { type: 'linear', targets: [{ id: stepM[1] }] }
+
+  return { type: 'default', targets: [] }
+}
+
+// ─── Markdown parser ──────────────────────────────────────────────────────────
+
 function getTableAttr(body: string, attr: string): string {
-  const re = new RegExp(`\\|\\s*${attr}\\s*\\|\\s*(.+?)\\s*\\|`)
+  // Escape regex special chars in attr (e.g. ⚙️)
+  const escaped = attr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`\\|[^|]*${escaped}[^|]*\\|\\s*(.+?)\\s*\\|`)
   const m = body.match(re)
-  return m ? m[1].replace(/\*\*/g, '').trim() : ''
+  // Strip markdown bold, icons, backticks
+  return m ? m[1].replace(/\*\*/g, '').replace(/⚙️/g, '').replace(/`/g, '').trim() : ''
 }
 
 function parseMarkdown(content: string): ProcessMeta {
   const titleMatch = content.match(/^# (.+)/m)
   const title = titleMatch ? titleMatch[1].trim() : 'Process'
-  const idMatch = title.match(/^([A-Z]+-\d+)/)
+  const idMatch = title.match(/^([A-Z]+-\d+)/i)
   const processId = idMatch ? idMatch[1].replace('-', '_') : 'proc_001'
 
-  const typeMatch = content.match(/\*\*Typ:\*\* (.+)/)
-  const dateMatch = content.match(/\*\*Data udokumentowania:\*\* (.+)/)
+  const typeMatch = content.match(/\*\*Typ:\*\*\s*(.+)/)
+  const dateMatch = content.match(/\*\*Data udokumentowania:\*\*\s*(.+)/)
 
   const steps: ProcessStep[] = []
-  // Match each step block: ### S{n} – {name} ... until next ### S or section boundary
-  const stepRegex = /### (S\d+)([^\n]*)\n([\s\S]+?)(?=\n### S\d+|\n---|\n## |$)/g
+  const stepRegex = /### (S\d+)([^\n]*)\n([\s\S]+?)(?=\n### S\d+|\n---|\n## |$)/gi
   let m: RegExpExecArray | null
 
   while ((m = stepRegex.exec(content)) !== null) {
@@ -54,7 +106,7 @@ function parseMarkdown(content: string): ProcessMeta {
     const rawHeader = m[2].trim()
     const name = rawHeader.includes('–') ? rawHeader.split('–').slice(1).join('–').trim() : rawHeader
     steps.push({
-      id: m[1],
+      id: m[1].toUpperCase(),
       name,
       area: getTableAttr(body, 'Obszar'),
       activities: getTableAttr(body, 'Czynności'),
@@ -74,6 +126,8 @@ function parseMarkdown(content: string): ProcessMeta {
   }
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function sid(s: string): string {
   return s.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').toLowerCase()
 }
@@ -85,6 +139,8 @@ function x(s: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 }
+
+// ─── Layout types ─────────────────────────────────────────────────────────────
 
 interface LayoutNode {
   xmlId: string
@@ -99,57 +155,184 @@ interface LayoutEdge {
   source: string
   target: string
   name?: string
+  isLoop?: boolean
 }
+
+// ─── BPMN generator ──────────────────────────────────────────────────────────
 
 function generateBpmn(meta: ProcessMeta): string {
   const { id, title, steps } = meta
 
-  // Collect unique lane names preserving order
+  // ── 1. Lane names (order preserved) ─────────────────────────────────────
   const laneNames: string[] = []
   steps.forEach((s) => {
     const a = s.area || 'Proces'
     if (!laneNames.includes(a)) laneNames.push(a)
   })
-  if (laneNames.length === 0) laneNames.push('Proces')
+  if (!laneNames.length) laneNames.push('Proces')
 
   const laneId = (name: string) => `lane_${sid(name)}`
-
-  // Build node list
-  const nodes: LayoutNode[] = []
   const firstArea = steps[0]?.area || laneNames[0]
   const lastArea = steps[steps.length - 1]?.area || laneNames[laneNames.length - 1]
 
-  nodes.push({ xmlId: 'se_start', type: 'startEvent', name: steps[0]?.trigger || 'Start', lane: firstArea, col: 0 })
+  // ── 2. Parse routing for all steps ──────────────────────────────────────
+  const routingMap = new Map<string, Routing>()
+  steps.forEach((s) => routingMap.set(s.id, parseNextField(s.next)))
 
-  let col = 1
+  // ── 3. Identify AND / XOR merge groups ───────────────────────────────────
+  // Consecutive (scal AND/XOR) steps → next non-scal step is the merge target
+  type MergeGroup = { type: 'and-merge' | 'xor-merge'; scalSteps: string[]; mergeTarget: string }
+  const mergeGroups: MergeGroup[] = []
+  let currentScalAnd: string[] = []
+  let currentScalXor: string[] = []
+
+  const flushScal = (nextStepId: string) => {
+    if (currentScalAnd.length) {
+      mergeGroups.push({ type: 'and-merge', scalSteps: [...currentScalAnd], mergeTarget: nextStepId })
+      currentScalAnd = []
+    }
+    if (currentScalXor.length) {
+      mergeGroups.push({ type: 'xor-merge', scalSteps: [...currentScalXor], mergeTarget: nextStepId })
+      currentScalXor = []
+    }
+  }
+
+  steps.forEach((step, idx) => {
+    const r = routingMap.get(step.id)!
+    if (r.type === 'and-merge') {
+      currentScalAnd.push(step.id)
+    } else if (r.type === 'xor-merge') {
+      currentScalXor.push(step.id)
+    } else {
+      flushScal(step.id)
+    }
+  })
+  // trailing scal steps → connect to end
+  if (currentScalAnd.length || currentScalXor.length) flushScal('__end__')
+
+  // Lookup: mergeTarget → merge group
+  const mergeForTarget = new Map<string, MergeGroup>()
+  mergeGroups.forEach((g) => mergeForTarget.set(g.mergeTarget, g))
+
+  // Helper: resolve the actual xmlId to target (accounting for merge gateway before it)
+  const taskXmlId = (stepId: string) => `task_${sid(stepId)}`
+  const resolveTarget = (stepId: string): string => {
+    if (stepId === '__end__') return 'ee_end'
+    const mg = mergeForTarget.get(stepId)
+    if (mg) return mg.type === 'and-merge' ? `gw_and_merge_${sid(stepId)}` : `gw_xor_merge_${sid(stepId)}`
+    return taskXmlId(stepId)
+  }
+
+  // ── 4. Build node list ────────────────────────────────────────────────────
+  const nodes: LayoutNode[] = []
+  let col = 0
+
+  nodes.push({ xmlId: 'se_start', type: 'startEvent', name: steps[0]?.trigger || 'Start', lane: firstArea, col: col++ })
+
   steps.forEach((step) => {
+    // Insert merge gateway BEFORE this step if it's a merge target
+    const mg = mergeForTarget.get(step.id)
+    if (mg) {
+      const gwType = mg.type === 'and-merge' ? 'parallelGateway' : 'exclusiveGateway'
+      const gwId = mg.type === 'and-merge' ? `gw_and_merge_${sid(step.id)}` : `gw_xor_merge_${sid(step.id)}`
+      nodes.push({ xmlId: gwId, type: gwType, name: '', lane: step.area || laneNames[0], col: col++ })
+    }
+
+    // The task itself
     nodes.push({
-      xmlId: `task_${sid(step.id)}`,
+      xmlId: taskXmlId(step.id),
       type: 'task',
       name: `${step.id} – ${step.name}`,
       lane: step.area || laneNames[0],
       col: col++,
     })
 
-    const hasAnd = /AND|równolegle/i.test(step.next)
-    const hasXor = /XOR|wyłącznie|decyzja/i.test(step.next)
-    if (hasAnd) {
+    // Insert split gateway AFTER this step
+    const r = routingMap.get(step.id)!
+    if (r.type === 'and-split') {
       nodes.push({ xmlId: `gw_and_${sid(step.id)}`, type: 'parallelGateway', name: '', lane: step.area || laneNames[0], col: col++ })
-    } else if (hasXor) {
+    } else if (r.type === 'xor-split') {
       nodes.push({ xmlId: `gw_xor_${sid(step.id)}`, type: 'exclusiveGateway', name: '', lane: step.area || laneNames[0], col: col++ })
     }
   })
 
   nodes.push({ xmlId: 'ee_end', type: 'endEvent', name: 'Koniec procesu', lane: lastArea, col: col })
 
-  // Build simple linear sequence flows
+  // ── 5. Build edge list ────────────────────────────────────────────────────
   const edges: LayoutEdge[] = []
-  const mainFlow = nodes.filter((n) => !n.xmlId.startsWith('gw_'))
-  for (let i = 0; i < mainFlow.length - 1; i++) {
-    edges.push({ id: `sf_${i + 1}`, source: mainFlow[i].xmlId, target: mainFlow[i + 1].xmlId })
-  }
+  let ei = 0
+  const E = (source: string, target: string, name?: string, isLoop?: boolean) =>
+    edges.push({ id: `sf_${++ei}`, source, target, name, isLoop })
 
-  // Layout constants
+  // Start → first target (or merge gateway before it)
+  E('se_start', resolveTarget(steps[0]?.id ?? '__end__'))
+
+  steps.forEach((step, idx) => {
+    const r = routingMap.get(step.id)!
+    const src = taskXmlId(step.id)
+
+    switch (r.type) {
+      case 'end':
+        E(src, 'ee_end')
+        break
+
+      case 'and-split': {
+        const gw = `gw_and_${sid(step.id)}`
+        E(src, gw)
+        r.targets.forEach((t) => E(gw, resolveTarget(t.id)))
+        break
+      }
+
+      case 'xor-split': {
+        const gw = `gw_xor_${sid(step.id)}`
+        E(src, gw)
+        r.targets.forEach((t) => E(gw, resolveTarget(t.id), t.label))
+        break
+      }
+
+      case 'and-merge':
+      case 'xor-merge': {
+        // scal step → merge gateway
+        const group = mergeGroups.find((g) => g.scalSteps.includes(step.id))
+        if (group) {
+          const gwId =
+            group.type === 'and-merge'
+              ? `gw_and_merge_${sid(group.mergeTarget)}`
+              : `gw_xor_merge_${sid(group.mergeTarget)}`
+          E(src, gwId)
+          // Merge gateway → merge target (add once, when last scal step of group is processed)
+          if (group.scalSteps[group.scalSteps.length - 1] === step.id) {
+            E(gwId, resolveTarget(group.mergeTarget === '__end__' ? '__end__' : group.mergeTarget))
+          }
+        }
+        break
+      }
+
+      case 'loop':
+        if (r.targets.length) E(src, resolveTarget(r.targets[0].id), 'powrót', true)
+        break
+
+      case 'linear':
+        if (r.targets.length) E(src, resolveTarget(r.targets[0].id))
+        break
+
+      default: {
+        // Default: connect to next non-scal step in array, or end event
+        let nextTarget = 'ee_end'
+        for (let j = idx + 1; j < steps.length; j++) {
+          const nr = routingMap.get(steps[j].id)!
+          if (nr.type !== 'and-merge' && nr.type !== 'xor-merge') {
+            nextTarget = steps[j].id
+            break
+          }
+        }
+        E(src, resolveTarget(nextTarget))
+        break
+      }
+    }
+  })
+
+  // ── 6. Layout constants ───────────────────────────────────────────────────
   const POOL_X = 100
   const POOL_Y = 80
   const LANE_HEADER = 30
@@ -186,6 +369,7 @@ function generateBpmn(meta: ProcessMeta): string {
     }
   })
 
+  // ── 7. XML output ─────────────────────────────────────────────────────────
   const lines: string[] = []
   const P = (s: string) => lines.push(s)
 
@@ -197,7 +381,7 @@ function generateBpmn(meta: ProcessMeta): string {
   P(`             xmlns:omgdi="http://www.omg.org/spec/DD/20100524/DI"`)
   P(`             typeLanguage="http://www.w3.org/2001/XMLSchema"`)
   P(`             expressionLanguage="http://www.w3.org/1999/XPath"`)
-  P(`             targetNamespace="http://vive.com.pl/bpmn/${sid(id)}">`)
+  P(`             targetNamespace="http://example.com/bpmn/${sid(id)}">`)
   P(``)
   P(`  <process id="proc_${sid(id)}" name="${x(title)}" isExecutable="false">`)
   P(``)
@@ -206,7 +390,7 @@ function generateBpmn(meta: ProcessMeta): string {
   laneNames.forEach((lane) => {
     P(`      <lane id="${laneId(lane)}" name="${x(lane)}">`)
     nodes
-      .filter((n) => n.lane === lane || (!laneNames.includes(n.lane) && lane === laneNames[0]))
+      .filter((n) => n.lane === lane)
       .forEach((n) => P(`        <flowNodeRef>${n.xmlId}</flowNodeRef>`))
     P(`      </lane>`)
   })
@@ -214,7 +398,7 @@ function generateBpmn(meta: ProcessMeta): string {
   P(`    </laneSet>`)
   P(``)
 
-  // Elements
+  // BPMN elements
   nodes.forEach((n) => {
     const na = n.name ? ` name="${x(n.name)}"` : ''
     if (n.type === 'startEvent') {
@@ -226,7 +410,7 @@ function generateBpmn(meta: ProcessMeta): string {
     } else if (n.type === 'exclusiveGateway') {
       P(`    <exclusiveGateway id="${n.xmlId}"${na}/>`)
     } else {
-      const step = steps.find((s) => n.xmlId === `task_${sid(s.id)}`)
+      const step = steps.find((s) => n.xmlId === taskXmlId(s.id))
       P(`    <task id="${n.xmlId}"${na}>`)
       if (step?.activities) P(`      <documentation>${x(step.activities)}</documentation>`)
       P(`    </task>`)
@@ -244,8 +428,6 @@ function generateBpmn(meta: ProcessMeta): string {
   P(``)
   P(`  <bpmndi:BPMNDiagram id="BPMNDiagram_1">`)
   P(`    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="proc_${sid(id)}">`)
-
-  // Pool shape (optional wrapper, helps in some tools)
   P(`      <!-- Pool bounds: ${poolW} x ${poolH} -->`)
 
   // Lane shapes
@@ -259,27 +441,36 @@ function generateBpmn(meta: ProcessMeta): string {
 
   // Node shapes
   nodes.forEach((n) => {
-    const r = pos.get(n.xmlId)!
+    const r = pos.get(n.xmlId)
+    if (!r) return
     P(`      <bpmndi:BPMNShape id="${n.xmlId}_di" bpmnElement="${n.xmlId}">`)
     P(`        <omgdc:Bounds x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}"/>`)
-    if (n.name && n.type === 'task') {
-      P(`        <bpmndi:BPMNLabel/>`)
-    }
+    if (n.name && n.type === 'task') P(`        <bpmndi:BPMNLabel/>`)
     P(`      </bpmndi:BPMNShape>`)
   })
 
   // Edge waypoints
   edges.forEach((e) => {
-    const s = pos.get(e.source)!
-    const t = pos.get(e.target)!
+    const s = pos.get(e.source)
+    const t = pos.get(e.target)
+    if (!s || !t) return
+
     const sx = Math.round(s.x + s.w)
     const sy = Math.round(s.y + s.h / 2)
     const tx = Math.round(t.x)
     const ty = Math.round(t.y + t.h / 2)
 
     P(`      <bpmndi:BPMNEdge id="${e.id}_di" bpmnElement="${e.id}">`)
-    if (sy !== ty) {
-      // elbow routing when crossing lanes
+
+    if (e.isLoop) {
+      // Loop: arc below the tasks
+      const loopY = Math.max(sy, ty) + 60
+      P(`        <omgdi:waypoint x="${sx}" y="${sy}"/>`)
+      P(`        <omgdi:waypoint x="${sx}" y="${loopY}"/>`)
+      P(`        <omgdi:waypoint x="${tx}" y="${loopY}"/>`)
+      P(`        <omgdi:waypoint x="${tx}" y="${ty}"/>`)
+    } else if (sy !== ty) {
+      // Elbow routing when crossing lanes
       const mx = Math.round((sx + tx) / 2)
       P(`        <omgdi:waypoint x="${sx}" y="${sy}"/>`)
       P(`        <omgdi:waypoint x="${mx}" y="${sy}"/>`)
@@ -299,15 +490,17 @@ function generateBpmn(meta: ProcessMeta): string {
   return lines.join('\n')
 }
 
+// ─── Tool class ───────────────────────────────────────────────────────────────
+
 export default class GenerateBpmnTool extends Tool<Schema> {
   name = 'generate_bpmn'
   title = 'Generuj BPMN z Markdown'
   description =
-    'Konwertuje plik .md z dokumentacją procesu (format VIVE ERP: sekcje ### S{n} – {nazwa} z tabelami atrybutów) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Tworzy lanes per Obszar, tasks per krok, gateways AND/XOR, sequence flows i layout DI.'
+    'Konwertuje plik .md z dokumentacją procesu (format VIVE ERP / szablon-procesu.md) na plik BPMN 2.0 XML gotowy do importu w Camunda Modeler lub bpmn.io. Obsługuje: przepływ liniowy, bramki AND (split+merge), XOR (decyzje), pętle powrotne, zdarzenia końcowe.'
 
   async handle({ args, response }: ToolContext<Schema>) {
-    const viveRoot = process.env.MCP_WORKSPACE_ROOT || 'C:\\projects\\vive_ERP'
-    const sourcePath = join(viveRoot, args?.source_path ?? '')
+    const workspaceRoot = process.env.MCP_WORKSPACE_ROOT || 'C:\\projects\\vive_ERP'
+    const sourcePath = join(workspaceRoot, args?.source_path ?? '')
 
     if (!args?.source_path) {
       return response.text('BŁĄD: Parametr source_path jest wymagany.')
@@ -315,10 +508,10 @@ export default class GenerateBpmnTool extends Tool<Schema> {
 
     let outputPath: string
     if (args?.output_path) {
-      outputPath = join(viveRoot, args.output_path)
+      outputPath = join(workspaceRoot, args.output_path)
     } else {
       const base = basename(sourcePath, extname(sourcePath))
-      outputPath = join(viveRoot, 'raport', `${base}.bpmn`)
+      outputPath = join(workspaceRoot, 'raport', `${base}.bpmn`)
     }
 
     let content: string
@@ -333,7 +526,7 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     if (meta.steps.length === 0) {
       return response.text(
         `BŁĄD: Nie znaleziono kroków procesu w ${args?.source_path}.\n` +
-          `Sprawdź czy plik zawiera sekcje "### S{n} – {nazwa}".`
+          `Sprawdź czy plik zawiera sekcje "### S{n} – {nazwa}" z atrybutem "Obszar".`
       )
     }
 
@@ -342,15 +535,21 @@ export default class GenerateBpmnTool extends Tool<Schema> {
     await mkdir(dirname(outputPath), { recursive: true })
     await writeFile(outputPath, bpmn, 'utf-8')
 
-    const relOutput = outputPath.replace(viveRoot + '\\', '')
+    const relOutput = outputPath.replace(workspaceRoot + '\\', '').replace(workspaceRoot + '/', '')
     const lanes = [...new Set(meta.steps.map((s) => s.area).filter(Boolean))]
+
+    // Count gateways
+    const routings = meta.steps.map((s) => parseNextField(s.next))
+    const andSplits = routings.filter((r) => r.type === 'and-split').length
+    const xorSplits = routings.filter((r) => r.type === 'xor-split').length
+    const loops = routings.filter((r) => r.type === 'loop').length
 
     return response.text(
       `✅ BPMN wygenerowany pomyślnie!\n\n` +
         `📄 Plik wyjściowy: ${relOutput}\n` +
         `🔢 Kroków procesu: ${meta.steps.length}\n` +
         `🏊 Lanes (Obszary): ${lanes.join(' | ')}\n` +
-        `📦 Węzłów BPMN: start + ${meta.steps.length} tasks + end\n\n` +
+        `🔀 Bramki AND: ${andSplits} | XOR: ${xorSplits} | Pętle: ${loops}\n\n` +
         `Otwórz w: https://demo.bpmn.io (przeciągnij plik) lub Camunda Modeler.`
     )
   }
@@ -362,12 +561,12 @@ export default class GenerateBpmnTool extends Tool<Schema> {
         source_path: {
           type: 'string',
           description:
-            'Ścieżka do pliku .md, relatywna do C:\\projects\\vive_ERP. Np. procesy/Ochrona-Srodowiska/OS-001-SENT-wysylka-krajowa-as-is.md',
+            'Ścieżka do pliku .md relatywna do MCP_WORKSPACE_ROOT. Np. procesy/Ochrona-Srodowiska/OS-001-SENT-wysylka-krajowa-as-is.md',
         },
         output_path: {
           type: 'string',
           description:
-            'Opcjonalna ścieżka wyjściowa .bpmn, relatywna do C:\\projects\\vive_ERP. Domyślnie: raport/{nazwa-pliku}.bpmn',
+            'Opcjonalna ścieżka wyjściowa .bpmn relatywna do MCP_WORKSPACE_ROOT. Domyślnie: raport/{nazwa-pliku}.bpmn',
         },
       },
       required: ['source_path'],

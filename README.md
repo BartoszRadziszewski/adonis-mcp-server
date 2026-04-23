@@ -99,18 +99,30 @@ curl -s -X POST http://localhost:3333/mcp \
 
 ## Podłączenie projektu do serwera
 
-W każdym projekcie, z którym chcesz używać serwera MCP, dodaj plik `.mcp.json`:
+W każdym projekcie, z którym chcesz używać serwera MCP, utwórz plik `.mcp.json` w katalogu głównym projektu.
+
+### ✅ Zalecany sposób – nagłówek `X-Workspace-Root` (w pełni automatyczny)
 
 ```json
 {
   "mcpServers": {
     "adonis-mcp-server": {
       "type": "http",
-      "url": "http://localhost:3333/mcp"
+      "url": "http://localhost:3333/mcp",
+      "headers": {
+        "X-Workspace-Root": "C:/projects/moj-projekt"
+      }
     }
   }
 }
 ```
+
+Claude Code dołącza ten nagłówek do **każdego** wywołania MCP. Serwer automatycznie używa podanej ścieżki jako workspace – **bez żadnej ręcznej konfiguracji**.
+
+**Zalety:**
+- Zero przełączania – każdy projekt ma własne `.mcp.json` ze swoją ścieżką
+- Wiele projektów otwartych jednocześnie – każdy widzi swój workspace
+- Nie trzeba restartować serwera ani ustawiać workspace ręcznie
 
 Po restarcie Claude Code narzędzia MCP będą dostępne.
 
@@ -120,35 +132,41 @@ Po restarcie Claude Code narzędzia MCP będą dostępne.
 
 ## Zarządzanie aktywnymi projektami (workspace)
 
-Jeden serwer obsługuje dowolną liczbę projektów. Narzędzia wiedzą, skąd czytać i gdzie zapisywać pliki dzięki **aktywnemu workspace**.
+Jeden serwer obsługuje dowolną liczbę projektów jednocześnie. Narzędzia wiedzą, skąd czytać i gdzie zapisywać pliki dzięki **aktywnemu workspace** – automatycznie ustawianemu z nagłówka HTTP każdego żądania.
 
 ### Jak działa priorytet workspace
 
 Każde wywołanie narzędzia szuka ścieżki projektu w następującej kolejności:
 
 ```
-1. parametr workspace_root w wywołaniu  (najwyższy priorytet)
+1. parametr workspace_root w wywołaniu           (najwyższy priorytet)
         ↓ nie podano
-2. mcp-workspace.json                   (ustawiony przez set_workspace lub npm run workspace)
+2. nagłówek X-Workspace-Root w żądaniu HTTP      (z .mcp.json projektu – automatyczne)
+        ↓ brak nagłówka
+3. mcp-workspace.json                            (ręcznie ustawiony przez set_workspace lub npm run workspace)
         ↓ plik nie istnieje
-3. MCP_WORKSPACE_ROOT w .env            (fallback startowy)
+4. MCP_WORKSPACE_ROOT w .env                     (stały fallback)
         ↓ brak
-4. błąd – workspace nie ustawiony
+5. błąd – workspace nie ustawiony
 ```
 
-### Metoda 1 – przez Claude Code (zalecana)
+### Metoda A – nagłówek w `.mcp.json` (zalecana, zero ręcznej pracy)
+
+Dodaj `"headers": { "X-Workspace-Root": "..." }` do `.mcp.json` projektu (patrz wyżej). Od tej chwili każde wywołanie narzędzia z tego projektu automatycznie trafi do właściwego katalogu.
+
+### Metoda B – przez Claude Code (jednorazowo per sesja)
 
 Na początku pracy z projektem powiedz Claude:
 
 > *„Ustaw workspace na C:/projects/moj-projekt"*
 
-Claude wywoła `set_workspace` – zmiana jest **natychmiastowa**, serwer nie wymaga restartu.
+Claude wywoła `set_workspace` – zmiana jest **natychmiastowa**, serwer nie wymaga restartu. Ustawienie jest zapisywane w `mcp-workspace.json` i obowiązuje dopóki nie zmienisz go na inny projekt.
 
 Sprawdź aktualny workspace:
 
 > *„Jaki mam teraz aktywny workspace?"*
 
-### Metoda 2 – przez terminal (npm script)
+### Metoda C – przez terminal (npm script)
 
 ```bash
 # Ustaw aktywny projekt
@@ -166,32 +184,26 @@ Przykładowy wynik:
    Serwer nie wymaga restartu – zmiana aktywna natychmiast.
 ```
 
-### Metoda 3 – parametr przy każdym wywołaniu
+### Metoda D – parametr przy każdym wywołaniu
 
-Możesz też podać ścieżkę bezpośrednio:
+Możesz też podać ścieżkę bezpośrednio dla jednego wywołania:
 
 > *„Wygeneruj BPMN z C:/projects/inny-projekt/procesy/P2P-001.md"*
 
 Claude przekaże `workspace_root` jako parametr do narzędzia.
 
-### Jak wygląda typowy przepływ pracy
+### Praca z wieloma projektami jednocześnie
+
+Dzięki nagłówkowi `X-Workspace-Root` możesz mieć kilka projektów otwartych w Claude Code naraz – każdy ze swoim `.mcp.json`:
 
 ```
-Rano – przełączasz się na projekt A:
-  npm run workspace -- C:/projects/projekt-A
-  (lub poproś Claude: "ustaw workspace projekt-A")
-
-Pracujesz cały dzień:
-  Claude generuje BPMN, czyta pliki – wszystko z projekt-A
-
-Wieczór – przełączasz się na projekt B:
-  npm run workspace -- C:/projects/projekt-B
-
-Następnego dnia – sprawdzasz gdzie jesteś:
-  npm run workspace      (bez argumentu → wyświetla aktualny)
+projekt-A/.mcp.json  →  "X-Workspace-Root": "C:/projects/projekt-A"
+projekt-B/.mcp.json  →  "X-Workspace-Root": "C:/projects/projekt-B"
 ```
 
-> **Plik `mcp-workspace.json`** jest ignorowany przez git (`.gitignore`) – to Twoje lokalne ustawienie, nie jest wersjonowane.
+Serwer rozróżnia, z którego projektu pochodzi żądanie i używa właściwej ścieżki. **Nie trzeba nic przełączać.**
+
+> **Plik `mcp-workspace.json`** jest ignorowany przez git (`.gitignore`) – to lokalne ustawienie fallback, nie jest wersjonowane.
 
 ---
 
@@ -328,6 +340,9 @@ const toolFiles = [
 ```
 adonis-mcp-server/
 ├── app/
+│   ├── middleware/
+│   │   ├── workspace_context.ts        ← AsyncLocalStorage (workspace per request)
+│   │   └── workspace_middleware.ts     ← czyta nagłówek X-Workspace-Root
 │   └── mcp/
 │       └── tools/
 │           ├── set_workspace_tool.ts   ← zarządzanie aktywnym projektem
@@ -338,10 +353,11 @@ adonis-mcp-server/
 ├── docs/
 │   └── szablon-procesu.md             ← szablon dokumentacji procesu
 ├── start/
+│   ├── kernel.ts                      ← rejestracja middleware (workspace_middleware)
 │   ├── mcp.ts                         ← rejestracja narzędzi
 │   ├── routes.ts                      ← trasa /mcp
 │   └── env.ts                         ← walidacja zmiennych środowiskowych
-├── mcp-workspace.json                 ← aktywny workspace (gitignored)
+├── mcp-workspace.json                 ← aktywny workspace fallback (gitignored)
 ├── .env.example                       ← szablon konfiguracji
 └── adonisrc.ts                        ← rejestracja providerów AdonisJS
 ```
